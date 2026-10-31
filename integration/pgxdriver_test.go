@@ -1,4 +1,4 @@
-package pgxdriver_test
+package integration_test
 
 import (
 	"context"
@@ -7,11 +7,11 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/dmitrydorofeev/pats"
-	"github.com/dmitrydorofeev/pats/internal/testsuite"
+	"github.com/dmitrydorofeev/pats/integration/testsuite"
 	"github.com/dmitrydorofeev/pats/pgxdriver"
 )
 
-func TestSuite(t *testing.T) {
+func TestSuitePgx(t *testing.T) {
 	testsuite.Run(t, func(t *testing.T, dsn string) testsuite.Harness {
 		pool, err := pgxpool.New(context.Background(), dsn)
 		if err != nil {

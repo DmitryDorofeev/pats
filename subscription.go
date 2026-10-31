@@ -183,10 +183,18 @@ func (s *Subscription) handle(m *Msg) {
 	}
 	switch {
 	case panicked:
-		s.conn.logError("nak", m.Nak(0), "consumer", s.name, "message", m.ID)
+		s.conn.logError("nak", m.Nak(s.panicDelay(m.Delivery)), "consumer", s.name, "message", m.ID)
 	case !s.opts.manualAck:
 		s.conn.logError("ack", m.Ack(), "consumer", s.name, "message", m.ID)
 	}
+}
+
+// panicDelay is how long a message waits before redelivery after its handler
+// panicked: 100ms, doubling with each delivery, capped at AckWait. Without
+// it a poison message would be redelivered in a tight loop.
+func (s *Subscription) panicDelay(delivery int) time.Duration {
+	d := 100 * time.Millisecond << min(max(delivery-1, 0), 20)
+	return min(d, s.opts.ackWait)
 }
 
 // Unsubscribe stops delivery. Handlers already running finish in the

@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"sync"
 	"sync/atomic"
@@ -20,6 +21,7 @@ import (
 	"github.com/testcontainers/testcontainers-go/wait"
 
 	"github.com/dmitrydorofeev/pats"
+	"github.com/dmitrydorofeev/pats/patsmigrate"
 )
 
 // Harness is what a driver package provides to the suite.
@@ -75,7 +77,18 @@ type env struct {
 	admin  *pgxpool.Pool
 }
 
+// newEnv returns an env whose schema is fully migrated.
 func newEnv(t *testing.T, f Factory) *env {
+	t.Helper()
+	e := newBareEnv(t, f)
+	if _, err := e.migrator(nil).Migrate(ctx, patsmigrate.DirectionUp, nil); err != nil {
+		t.Fatal(err)
+	}
+	return e
+}
+
+// newBareEnv returns an env whose schema has not been created.
+func newBareEnv(t *testing.T, f Factory) *env {
 	t.Helper()
 	dsn := DSN(t)
 	admin, err := pgxpool.New(context.Background(), dsn)
@@ -90,6 +103,15 @@ func newEnv(t *testing.T, f Factory) *env {
 		_, _ = admin.Exec(context.Background(), "DROP SCHEMA IF EXISTS "+e.schema+" CASCADE")
 	})
 	return e
+}
+
+func (e *env) migrator(logger *slog.Logger) *patsmigrate.Migrator {
+	e.t.Helper()
+	m, err := patsmigrate.New(e.h.Driver, &patsmigrate.Config{Schema: e.schema, Logger: logger})
+	if err != nil {
+		e.t.Fatal(err)
+	}
+	return m
 }
 
 // connect opens a Conn on the test schema. By default polling is effectively
@@ -179,6 +201,15 @@ func Run(t *testing.T, f Factory) {
 		{"HeartbeatKeepsConsumerAlive", testHeartbeat},
 		{"ReapedConsumerReregistered", testReregister},
 		{"Drain", testDrain},
+		{"PanicBackoff", testPanicBackoff},
+		{"LeaseLost", testLeaseLost},
+		{"DeleteConsumerStopsSubscriptions", testDeleteConsumerStops},
+		{"OrphanReaper", testOrphanReaper},
+		{"MigrateUpDown", testMigrateUpDown},
+		{"MigrateNoLockWhenCurrent", testMigrateNoLockWhenCurrent},
+		{"MigrateConcurrent", testMigrateConcurrent},
+		{"MigrateOpts", testMigrateOpts},
+		{"ConnectDoesNotMigrate", testConnectDoesNotMigrate},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -215,13 +246,13 @@ func testSubjectMatchesSQL(t *testing.T, f Factory) {
 
 func testFanOut(t *testing.T, f Factory) {
 	e := newEnv(t, f)
-	// Concurrent acks from several consumers can leave a message for the
-	// janitor, so run it often.
-	c := e.connect(pats.WithJanitorInterval(100 * time.Millisecond))
+	// No janitor: the last of several concurrent acks deletes the message.
+	c := e.connect(pats.WithoutJanitor())
 	var chans []chan *pats.Msg
-	for i := 0; i < 3; i++ {
+	// Exact and wildcard filters take different paths in the fan-out trigger.
+	for _, pattern := range []string{"a.*", "a.x", ">"} {
 		ch, h := chanHandler(10)
-		if _, err := c.Subscribe(ctx, "a.*", h); err != nil {
+		if _, err := c.Subscribe(ctx, pattern, h); err != nil {
 			t.Fatal(err)
 		}
 		chans = append(chans, ch)
@@ -245,6 +276,10 @@ func testFanOut(t *testing.T, f Factory) {
 		}
 	}
 	noRecv(t, other, 200*time.Millisecond)
+	// A message nobody subscribed to is not stored at all.
+	if err := c.Publish(ctx, "nobody.listens", nil); err != nil {
+		t.Fatal(err)
+	}
 	// All deliveries acked, so the messages are removed.
 	eventually(t, 5*time.Second, func() bool { return e.count("SELECT count(*) FROM %s.messages") == 0 },
 		"messages not cleaned up after ack")
@@ -469,9 +504,28 @@ func testRequestReply(t *testing.T, f Factory) {
 	if _, err := client.Request(rctx, "svc.nobody", nil); !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("Request without responder = %v", err)
 	}
-	// Inbox consumers are removed after each request.
-	if n := e.count("SELECT count(*) FROM %s.consumers WHERE filter LIKE '_INBOX.%%'"); n != 0 {
-		t.Fatalf("%d inbox consumers left", n)
+	// Concurrent requests all share the Conn's one inbox consumer.
+	var wg sync.WaitGroup
+	for i := range 20 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			rctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+			defer cancel()
+			want := fmt.Sprint(i)
+			reply, err := client.Request(rctx, "svc.echo", []byte(want))
+			if err != nil {
+				t.Error(err)
+				return
+			}
+			if string(reply.Data) != "echo: "+want {
+				t.Errorf("reply = %q, want echo: %s", reply.Data, want)
+			}
+		}()
+	}
+	wg.Wait()
+	if n := e.count("SELECT count(*) FROM %s.consumers WHERE filter LIKE '_INBOX.%%'"); n != 1 {
+		t.Fatalf("%d inbox consumers, want 1", n)
 	}
 }
 
@@ -667,5 +721,138 @@ func testReregister(t *testing.T, f Factory) {
 	_ = c.Publish(ctx, "rr", []byte("back"))
 	if m := recv(t, ch, 5*time.Second); string(m.Data) != "back" {
 		t.Fatalf("got %q", m.Data)
+	}
+}
+
+func testPanicBackoff(t *testing.T, f Factory) {
+	e := newEnv(t, f)
+	c := e.connect()
+	times := make(chan time.Time, 4)
+	_, err := c.Subscribe(ctx, "pb", func(m *pats.Msg) {
+		times <- time.Now()
+		if m.Delivery < 3 {
+			panic("boom")
+		}
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Publish(ctx, "pb", nil); err != nil {
+		t.Fatal(err)
+	}
+	var got []time.Time
+	for range 3 {
+		select {
+		case ts := <-times:
+			got = append(got, ts)
+		case <-time.After(5 * time.Second):
+			t.Fatalf("got %d deliveries, want 3", len(got))
+		}
+	}
+	// 100ms after the first panic, 200ms after the second.
+	if d := got[1].Sub(got[0]); d < 80*time.Millisecond {
+		t.Fatalf("second delivery after %v", d)
+	}
+	if d := got[2].Sub(got[1]); d < 180*time.Millisecond {
+		t.Fatalf("third delivery after %v", d)
+	}
+}
+
+// A handler whose lease expired must not be able to dead-letter or extend a
+// message that has been handed out again.
+func testLeaseLost(t *testing.T, f Factory) {
+	e := newEnv(t, f)
+	c := e.connect()
+	ch, h := chanHandler(4)
+	_, err := c.QueueSubscribe(ctx, "ll", "q", h, pats.ManualAck(), pats.AckWait(200*time.Millisecond),
+		pats.SubPollInterval(50*time.Millisecond), pats.MaxInFlight(2))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Publish(ctx, "ll", nil); err != nil {
+		t.Fatal(err)
+	}
+	stale := recv(t, ch, 5*time.Second)
+	fresh := recv(t, ch, 5*time.Second)
+	if fresh.Delivery != 2 {
+		t.Fatalf("delivery = %d, want 2", fresh.Delivery)
+	}
+	if err := stale.InProgress(); !errors.Is(err, pats.ErrLeaseLost) {
+		t.Fatalf("stale InProgress = %v", err)
+	}
+	if err := stale.Term("stale"); !errors.Is(err, pats.ErrLeaseLost) {
+		t.Fatalf("stale Term = %v", err)
+	}
+	if n := e.count("SELECT count(*) FROM %s.dead_letters"); n != 0 {
+		t.Fatalf("%d dead letters after a stale Term", n)
+	}
+	if err := fresh.InProgress(); err != nil {
+		t.Fatal(err)
+	}
+	if err := fresh.Term("bad"); err != nil {
+		t.Fatal(err)
+	}
+	if n := e.count("SELECT count(*) FROM %s.dead_letters WHERE attempts = 2"); n != 1 {
+		t.Fatalf("%d dead letters, want 1", n)
+	}
+	if n := e.count("SELECT count(*) FROM %s.messages"); n != 0 {
+		t.Fatalf("%d messages left after Term", n)
+	}
+}
+
+func testDeleteConsumerStops(t *testing.T, f Factory) {
+	e := newEnv(t, f)
+	local := e.connect()
+	remote := e.connect(pats.WithHeartbeat(50*time.Millisecond, time.Minute))
+	localCh, h1 := chanHandler(4)
+	remoteCh, h2 := chanHandler(4)
+	if _, err := local.Subscribe(ctx, "dc", h1, pats.Durable("dc")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := remote.Subscribe(ctx, "dc", h2, pats.Durable("dc")); err != nil {
+		t.Fatal(err)
+	}
+	if err := local.DeleteConsumer(ctx, "dc"); err != nil {
+		t.Fatal(err)
+	}
+	// Give the remote Conn a few heartbeats to notice. It must not
+	// re-create the durable consumer.
+	time.Sleep(300 * time.Millisecond)
+	if n := e.count("SELECT count(*) FROM %s.consumers"); n != 0 {
+		t.Fatalf("%d consumers after DeleteConsumer", n)
+	}
+	if err := local.Publish(ctx, "dc", nil); err != nil {
+		t.Fatal(err)
+	}
+	noRecv(t, localCh, 200*time.Millisecond)
+	noRecv(t, remoteCh, 0)
+}
+
+func testOrphanReaper(t *testing.T, f Factory) {
+	e := newEnv(t, f)
+	c := e.connect(pats.WithJanitorInterval(50 * time.Millisecond))
+	if _, err := c.Subscribe(ctx, "keep", func(*pats.Msg) {}, pats.Durable("keep"), pats.ManualAck(),
+		pats.AckWait(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.admin.Exec(ctx, fmt.Sprintf(
+		"INSERT INTO %s.consumers (name, filter, durable) VALUES ('gone', 'orphan', true)", e.schema)); err != nil {
+		t.Fatal(err)
+	}
+	// A backlog of messages that are still pending, then orphans behind it.
+	for range 20 {
+		_ = c.Publish(ctx, "keep", nil)
+	}
+	for range 5 {
+		_ = c.Publish(ctx, "orphan", nil)
+	}
+	if _, err := e.admin.Exec(ctx, fmt.Sprintf("DELETE FROM %s.consumers WHERE name = 'gone'", e.schema)); err != nil {
+		t.Fatal(err)
+	}
+	eventually(t, 5*time.Second, func() bool {
+		return e.count("SELECT count(*) FROM %s.messages WHERE subject = 'orphan'") == 0
+	}, "orphaned messages not reaped")
+	if n := e.count("SELECT count(*) FROM %s.messages WHERE subject = 'keep'"); n != 20 {
+		t.Fatalf("%d pending messages left, want 20", n)
 	}
 }

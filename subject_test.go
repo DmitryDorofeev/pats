@@ -2,7 +2,7 @@ package pats
 
 import "testing"
 
-// matchCases is mirrored by the SQL function test in internal/testsuite.
+// matchCases is mirrored by the SQL function test in integration/testsuite.
 var matchCases = []struct {
 	pattern, subject string
 	want             bool

@@ -13,6 +13,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/dmitrydorofeev/pats"
+	"github.com/dmitrydorofeev/pats/patsmigrate"
 	"github.com/dmitrydorofeev/pats/pgxdriver"
 )
 
@@ -24,7 +25,16 @@ func main() {
 	}
 	defer pool.Close()
 
-	nc, err := pats.Connect(ctx, pgxdriver.New(pool))
+	drv := pgxdriver.New(pool)
+	migrator, err := patsmigrate.New(drv, nil)
+	if err != nil {
+		log.Fatal(err)
+	}
+	if _, err := migrator.Migrate(ctx, patsmigrate.DirectionUp, nil); err != nil {
+		log.Fatal(err)
+	}
+
+	nc, err := pats.Connect(ctx, drv)
 	if err != nil {
 		log.Fatal(err)
 	}

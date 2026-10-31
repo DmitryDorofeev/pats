@@ -26,6 +26,9 @@ var (
 	ErrNotBound       = errors.New("pats: message was not received from a subscription")
 	ErrAlreadyAcked   = errors.New("pats: message already acknowledged")
 	ErrBadOption      = errors.New("pats: invalid option")
+	// ErrLeaseLost is returned by Nak, Term and InProgress when the
+	// message's lease expired and it was (or will be) delivered again.
+	ErrLeaseLost = errors.New("pats: message lease expired")
 )
 
 // Conn is a connection to the pats message system. It is safe for
@@ -41,27 +44,29 @@ type Conn struct {
 	cancel context.CancelFunc
 	bg     sync.WaitGroup
 
+	reapCursor int64 // janitor goroutine only
+
+	respMu     sync.Mutex
+	respPrefix string // reply subject prefix for Request; "" until first use
+	respWait   map[string]chan *Msg
+
 	mu        sync.Mutex
 	closed    bool
 	subs      map[*Subscription]struct{}
 	byConsume map[int64][]*Subscription
 }
 
-// Connect creates a Conn on top of drv, installing the schema unless
-// WithoutMigrate is given. The returned Conn does not own drv's underlying
-// pool; close that yourself after Conn.Close.
+// Connect creates a Conn on top of drv. The schema must already be installed
+// with package patsmigrate (or the pats CLI); Connect does not run
+// migrations. The returned Conn does not own drv's underlying pool; close
+// that yourself after Conn.Close.
 func Connect(ctx context.Context, drv Driver, opts ...Option) (*Conn, error) {
 	o := defaultConnOptions()
 	for _, opt := range opts {
 		opt(&o)
 	}
-	if err := validateSchema(o.schema); err != nil {
+	if err := ValidateSchema(o.schema); err != nil {
 		return nil, err
-	}
-	if o.migrate {
-		if err := Migrate(ctx, drv, o.schema); err != nil {
-			return nil, err
-		}
 	}
 	// Open the first listener synchronously so misconfiguration surfaces here.
 	l, err := drv.Listen(ctx, o.schema)
@@ -79,6 +84,7 @@ func Connect(ctx context.Context, drv Driver, opts ...Option) (*Conn, error) {
 		cancel:    cancel,
 		subs:      map[*Subscription]struct{}{},
 		byConsume: map[int64][]*Subscription{},
+		respWait:  map[string]chan *Msg{},
 	}
 	c.bg.Add(2)
 	go c.listenLoop(l)
@@ -124,21 +130,26 @@ func (c *Conn) publish(ctx context.Context, q Querier, m *Msg) error {
 
 // Request publishes data to subject with a unique reply subject and waits for
 // the first response. Use a context deadline as the timeout.
+//
+// All requests on a Conn share one response subscription, created on first
+// use, so a request costs a publish rather than a new consumer.
 func (c *Conn) Request(ctx context.Context, subject string, data []byte) (*Msg, error) {
-	inbox := NewInbox()
-	ch := make(chan *Msg, 1)
-	sub, err := c.Subscribe(ctx, inbox, func(m *Msg) {
-		select {
-		case ch <- m:
-		default:
-		}
-	})
+	prefix, err := c.responseInbox(ctx)
 	if err != nil {
 		return nil, err
 	}
-	defer sub.Unsubscribe()
+	token := randomID()
+	ch := make(chan *Msg, 1)
+	c.respMu.Lock()
+	c.respWait[token] = ch
+	c.respMu.Unlock()
+	defer func() {
+		c.respMu.Lock()
+		delete(c.respWait, token)
+		c.respMu.Unlock()
+	}()
 
-	if err := c.PublishMsg(ctx, &Msg{Subject: subject, Data: data, Reply: inbox}); err != nil {
+	if err := c.PublishMsg(ctx, &Msg{Subject: subject, Data: data, Reply: prefix + token}); err != nil {
 		return nil, err
 	}
 	select {
@@ -149,13 +160,60 @@ func (c *Conn) Request(ctx context.Context, subject string, data []byte) (*Msg, 
 	}
 }
 
+// responseInbox returns the reply subject prefix for Request, subscribing to
+// it on first use.
+func (c *Conn) responseInbox(ctx context.Context) (string, error) {
+	c.respMu.Lock()
+	defer c.respMu.Unlock()
+	if c.respPrefix != "" {
+		return c.respPrefix, nil
+	}
+	prefix := NewInbox() + "."
+	if _, err := c.Subscribe(ctx, prefix+"*", c.handleResponse, MaxInFlight(32)); err != nil {
+		return "", err
+	}
+	c.respPrefix = prefix
+	return prefix, nil
+}
+
+// handleResponse routes a reply to the waiting Request by the last token of
+// its subject. Late or duplicate replies are dropped.
+func (c *Conn) handleResponse(m *Msg) {
+	token := m.Subject[strings.LastIndexByte(m.Subject, '.')+1:]
+	c.respMu.Lock()
+	ch := c.respWait[token]
+	c.respMu.Unlock()
+	if ch != nil {
+		select {
+		case ch <- m:
+		default:
+		}
+	}
+}
+
 // NewInbox returns a unique subject suitable for replies.
 func NewInbox() string { return "_INBOX." + randomID() }
 
 // DeleteConsumer removes a consumer, typically a durable one, together with
-// all of its pending deliveries.
+// all of its pending deliveries. This Conn's subscriptions on the consumer
+// are stopped. Subscriptions in other processes notice at their next
+// heartbeat: durable ones stop, non-durable ones re-register the consumer.
 func (c *Conn) DeleteConsumer(ctx context.Context, name string) error {
-	return c.drv.Exec(ctx, c.q.deleteConsumerByName, name)
+	if err := c.drv.Exec(ctx, c.q.deleteConsumerByName, name); err != nil {
+		return err
+	}
+	c.mu.Lock()
+	var subs []*Subscription
+	for s := range c.subs {
+		if s.name == name {
+			subs = append(subs, s)
+		}
+	}
+	c.mu.Unlock()
+	for _, s := range subs {
+		s.stop()
+	}
+	return nil
 }
 
 // Subscribe delivers every message matching subject to cb. Each subscription
@@ -346,6 +404,26 @@ func (c *Conn) logError(msg string, err error, args ...any) {
 		return
 	}
 	c.opts.logger.Error("pats: "+msg, append([]any{"error", err}, args...)...)
+}
+
+// queryBool runs a statement returning at most one boolean row. No row
+// counts as false.
+func queryBool(ctx context.Context, q Querier, sql string, args ...any) (bool, error) {
+	rows, err := q.Query(ctx, sql, args...)
+	if err != nil {
+		return false, err
+	}
+	var ok bool
+	if rows.Next() {
+		err = rows.Scan(&ok)
+	}
+	if err == nil {
+		err = rows.Err()
+	}
+	if cerr := rows.Close(); err == nil {
+		err = cerr
+	}
+	return ok, err
 }
 
 func randomID() string {

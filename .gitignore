@@ -1,0 +1,14 @@
+# Binaries
+/pats
+*.exe
+*.test
+*.out
+
+# Coverage
+coverage.*
+*.cover
+
+# Editors and OS
+.idea/
+.vscode/
+.DS_Store

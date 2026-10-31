@@ -25,11 +25,11 @@ type Msg struct {
 	state      atomic.Bool // set once Ack/Nak/Term has been called
 }
 
-// opTimeout bounds acknowledgement statements, which run outside any caller
-// context.
+// opTimeout bounds acknowledgement statements issued by the methods that
+// take no context, and by pats itself.
 const opTimeout = 30 * time.Second
 
-func (m *Msg) opCtx() (context.Context, context.CancelFunc) {
+func opCtx() (context.Context, context.CancelFunc) {
 	return context.WithTimeout(context.Background(), opTimeout)
 }
 
@@ -43,52 +43,99 @@ func (m *Msg) settle() error {
 	return nil
 }
 
-// Ack marks the message as processed for this consumer.
+// Ack marks the message as processed for this consumer. It is AckCtx with a
+// 30s timeout.
 func (m *Msg) Ack() error {
-	if err := m.settle(); err != nil {
-		return err
-	}
-	ctx, cancel := m.opCtx()
+	ctx, cancel := opCtx()
 	defer cancel()
-	return m.sub.conn.drv.Exec(ctx, m.sub.conn.q.ack, m.consumerID, m.ID)
+	return m.AckCtx(ctx)
 }
 
-// Nak asks for redelivery after delay (zero means as soon as possible).
-func (m *Msg) Nak(delay time.Duration) error {
+// AckCtx marks the message as processed for this consumer. A late ack, after
+// the lease expired and the message was redelivered, still removes it.
+func (m *Msg) AckCtx(ctx context.Context) error {
 	if err := m.settle(); err != nil {
 		return err
 	}
-	ctx, cancel := m.opCtx()
-	defer cancel()
-	err := m.sub.conn.drv.Exec(ctx, m.sub.conn.q.nak, m.consumerID, m.ID, m.Delivery, delay.Milliseconds())
-	if err == nil {
-		m.sub.signalAfter(delay)
-	}
+	_, err := queryBool(ctx, m.sub.conn.drv, m.sub.conn.q.ack, m.consumerID, m.ID)
 	return err
 }
 
-// Term stops redelivery and moves the message to the dead-letter table with
-// the given reason.
-func (m *Msg) Term(reason string) error {
+// Nak asks for redelivery after delay (zero means as soon as possible). It is
+// NakCtx with a 30s timeout.
+func (m *Msg) Nak(delay time.Duration) error {
+	ctx, cancel := opCtx()
+	defer cancel()
+	return m.NakCtx(ctx, delay)
+}
+
+// NakCtx asks for redelivery after delay (zero means as soon as possible).
+// It returns ErrLeaseLost if the lease already expired.
+func (m *Msg) NakCtx(ctx context.Context, delay time.Duration) error {
 	if err := m.settle(); err != nil {
 		return err
 	}
-	ctx, cancel := m.opCtx()
-	defer cancel()
-	return m.sub.conn.drv.Exec(ctx, m.sub.conn.q.term, m.consumerID, m.ID, m.sub.name, reason)
+	ok, err := queryBool(ctx, m.sub.conn.drv, m.sub.conn.q.nak, m.consumerID, m.ID, m.Delivery, delay.Milliseconds())
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return ErrLeaseLost
+	}
+	m.sub.signalAfter(delay)
+	return nil
 }
 
-// InProgress extends the ack lease by the subscription's AckWait.
+// Term stops redelivery and moves the message to the dead-letter table with
+// the given reason. It is TermCtx with a 30s timeout.
+func (m *Msg) Term(reason string) error {
+	ctx, cancel := opCtx()
+	defer cancel()
+	return m.TermCtx(ctx, reason)
+}
+
+// TermCtx stops redelivery and moves the message to the dead-letter table
+// with the given reason. It returns ErrLeaseLost if the lease already
+// expired; the message is then left to whoever holds it now.
+func (m *Msg) TermCtx(ctx context.Context, reason string) error {
+	if err := m.settle(); err != nil {
+		return err
+	}
+	ok, err := queryBool(ctx, m.sub.conn.drv, m.sub.conn.q.term, m.consumerID, m.ID, m.Delivery, m.sub.name, reason)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return ErrLeaseLost
+	}
+	return nil
+}
+
+// InProgress extends the ack lease by the subscription's AckWait. It is
+// InProgressCtx with a 30s timeout.
 func (m *Msg) InProgress() error {
+	ctx, cancel := opCtx()
+	defer cancel()
+	return m.InProgressCtx(ctx)
+}
+
+// InProgressCtx extends the ack lease by the subscription's AckWait. It
+// returns ErrLeaseLost if the lease already expired.
+func (m *Msg) InProgressCtx(ctx context.Context) error {
 	if m.sub == nil {
 		return ErrNotBound
 	}
 	if m.state.Load() {
 		return ErrAlreadyAcked
 	}
-	ctx, cancel := m.opCtx()
-	defer cancel()
-	return m.sub.conn.drv.Exec(ctx, m.sub.conn.q.inProgress, m.consumerID, m.ID, m.Delivery, m.sub.opts.ackWait.Milliseconds())
+	ok, err := queryBool(ctx, m.sub.conn.drv, m.sub.conn.q.inProgress, m.consumerID, m.ID, m.Delivery, m.sub.opts.ackWait.Milliseconds())
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return ErrLeaseLost
+	}
+	return nil
 }
 
 // Respond publishes data to the message's reply subject.

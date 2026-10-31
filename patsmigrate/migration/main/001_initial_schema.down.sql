@@ -1,0 +1,11 @@
+DROP TRIGGER messages_fanout ON {{schema}}.messages;
+DROP FUNCTION {{schema}}.term(bigint, bigint, int, text, text);
+DROP FUNCTION {{schema}}.ack(bigint, bigint);
+DROP FUNCTION {{schema}}.release_message(bigint);
+DROP FUNCTION {{schema}}.on_message_insert();
+DROP FUNCTION {{schema}}.subject_matches(text, text);
+DROP TABLE {{schema}}.dead_letters;
+DROP TABLE {{schema}}.deliveries;
+DROP TABLE {{schema}}.consumers;
+DROP TABLE {{schema}}.messages;
+DROP TABLE {{schema}}.pats_migration;

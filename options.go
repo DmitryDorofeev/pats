@@ -10,7 +10,6 @@ type Option func(*connOptions)
 
 type connOptions struct {
 	schema            string
-	migrate           bool
 	logger            *slog.Logger
 	pollInterval      time.Duration
 	heartbeatInterval time.Duration
@@ -26,7 +25,6 @@ type connOptions struct {
 func defaultConnOptions() connOptions {
 	return connOptions{
 		schema:            "pats",
-		migrate:           true,
 		logger:            slog.Default(),
 		pollInterval:      5 * time.Second,
 		heartbeatInterval: 10 * time.Second,
@@ -40,12 +38,9 @@ func defaultConnOptions() connOptions {
 
 // WithSchema sets the PostgreSQL schema holding pats's tables (default
 // "pats"). The schema name is also used as the NOTIFY channel, so separate
-// schemas are fully isolated from each other.
+// schemas are fully isolated from each other. Install the schema with
+// patsmigrate.Config{Schema: name}.
 func WithSchema(name string) Option { return func(o *connOptions) { o.schema = name } }
-
-// WithoutMigrate stops Connect from installing the schema. Use SchemaSQL to
-// apply it with your own migration tooling.
-func WithoutMigrate() Option { return func(o *connOptions) { o.migrate = false } }
 
 // WithLogger sets the logger used for background errors.
 func WithLogger(l *slog.Logger) Option { return func(o *connOptions) { o.logger = l } }

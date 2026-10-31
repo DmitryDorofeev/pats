@@ -2,12 +2,17 @@ package pats
 
 import (
 	"context"
+	"slices"
 	"time"
 )
 
-const janitorBatch = 5000
+const (
+	janitorBatch       = 5000
+	janitorReapBatches = 10
+)
 
-// heartbeatLoop keeps this Conn's non-durable consumers alive. Consumers that
+// heartbeatLoop keeps this Conn's non-durable consumers alive and notices
+// consumers that disappeared. Consumers that
 // stop heartbeating (crashed processes, abandoned queue groups) are removed
 // by the janitor after the consumer TTL.
 func (c *Conn) heartbeatLoop() {
@@ -28,11 +33,9 @@ func (c *Conn) heartbeatLoop() {
 
 func (c *Conn) heartbeat(ctx context.Context) error {
 	c.mu.Lock()
-	owners := make(map[int64]*Subscription, len(c.byConsume))
 	ids := make([]int64, 0, len(c.byConsume))
 	for id, subs := range c.byConsume {
-		if len(subs) > 0 && !subs[0].opts.isDurable {
-			owners[id] = subs[0]
+		if len(subs) > 0 {
 			ids = append(ids, id)
 		}
 	}
@@ -58,29 +61,66 @@ func (c *Conn) heartbeat(ctx context.Context) error {
 		return err
 	}
 
-	// A consumer can be reaped while its subscribers are alive, e.g. if
-	// heartbeats failed for longer than the TTL. Re-register it so the
-	// subscriptions keep working; messages published in the gap are lost,
-	// as for any ephemeral subscription.
-	for id, s := range owners {
-		if alive[id] {
-			continue
+	for _, id := range ids {
+		if !alive[id] {
+			if err := c.consumerGone(ctx, id); err != nil {
+				return err
+			}
 		}
-		newID, err := c.upsertConsumer(ctx, s.name, s.subject, false)
-		if err != nil {
-			return err
-		}
-		c.opts.logger.Warn("pats: consumer was reaped while in use; re-registered", "consumer", s.name)
-		c.mu.Lock()
-		subs := c.byConsume[id]
-		delete(c.byConsume, id)
-		c.byConsume[newID] = append(c.byConsume[newID], subs...)
-		for _, x := range subs {
-			x.consumerID.Store(newID)
-			x.signal()
-		}
-		c.mu.Unlock()
 	}
+	return nil
+}
+
+// consumerGone handles a consumer row that disappeared while local
+// subscriptions still use it.
+//
+// A non-durable consumer can be reaped while its subscribers are alive, e.g.
+// if heartbeats failed for longer than the TTL. It is re-registered so the
+// subscriptions keep working; messages published in the gap are lost, as for
+// any ephemeral subscription. Durable consumers are never reaped, so a missing
+// one was deleted on purpose (DeleteConsumer): its subscriptions are stopped
+// rather than undoing the delete.
+func (c *Conn) consumerGone(ctx context.Context, id int64) error {
+	c.mu.Lock()
+	subs := slices.Clone(c.byConsume[id])
+	c.mu.Unlock()
+	if len(subs) == 0 {
+		return nil // unsubscribed in the meantime
+	}
+	s := subs[0]
+
+	if s.opts.isDurable {
+		c.opts.logger.Error("pats: durable consumer was deleted while subscribed; stopping its subscriptions", "consumer", s.name)
+		for _, x := range subs {
+			x.stop()
+		}
+		return nil
+	}
+
+	newID, err := c.upsertConsumer(ctx, s.name, s.subject, false)
+	if err != nil {
+		return err
+	}
+	c.mu.Lock()
+	subs = c.byConsume[id]
+	if len(subs) == 0 {
+		c.mu.Unlock()
+		// Every subscription went away while we re-registered. Don't leave
+		// behind a consumer that nobody reads; a shared queue consumer may
+		// have members elsewhere, and is reaped by TTL if not.
+		if s.ephemeral {
+			return c.drv.Exec(ctx, c.q.deleteConsumer, newID)
+		}
+		return nil
+	}
+	delete(c.byConsume, id)
+	c.byConsume[newID] = append(c.byConsume[newID], subs...)
+	for _, x := range subs {
+		x.consumerID.Store(newID)
+		x.signal()
+	}
+	c.mu.Unlock()
+	c.opts.logger.Warn("pats: consumer was reaped while in use; re-registered", "consumer", s.name)
 	return nil
 }
 
@@ -106,11 +146,41 @@ func (c *Conn) runJanitor(ctx context.Context) {
 	if c.opts.retentionMaxAge > 0 {
 		c.deleteBatches(ctx, "retention", c.q.retention, c.opts.retentionMaxAge.Milliseconds(), janitorBatch)
 	}
-	c.deleteBatches(ctx, "reap messages", c.q.reapOrphanMessages, janitorBatch)
+	c.reapOrphans(ctx)
 
 	if c.opts.deadLetterMaxAge > 0 {
 		_, err := c.deleteCount(ctx, c.q.deadLetterRetention, c.opts.deadLetterMaxAge.Milliseconds())
 		c.logError("dead letter retention", err)
+	}
+}
+
+// reapOrphans deletes messages that no consumer holds a delivery for, which
+// happens when a consumer is deleted or reaped. Each run scans at most
+// janitorReapBatches batches, continuing where the previous run stopped and
+// wrapping around at the end of the table, so the cost per run stays bounded
+// however large the backlog of pending messages is.
+func (c *Conn) reapOrphans(ctx context.Context) {
+	for range janitorReapBatches {
+		rows, err := c.drv.Query(ctx, c.q.reapOrphanMessages, c.reapCursor, janitorBatch)
+		if err != nil {
+			c.logError("reap messages", err)
+			return
+		}
+		var last int64
+		if rows.Next() {
+			err = rows.Scan(&last)
+		}
+		if cerr := rows.Close(); err == nil {
+			err = cerr
+		}
+		if err != nil {
+			c.logError("reap messages", err)
+			return
+		}
+		c.reapCursor = last
+		if last == 0 {
+			return
+		}
 	}
 }
 
