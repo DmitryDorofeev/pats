@@ -137,6 +137,7 @@ If a handler panics, the message is naked with a backoff of 100ms that doubles w
 
 ## Semantics and caveats
 
+- **PgBouncer.** Transaction pooling is not supported: `pats` relies on a dedicated PostgreSQL session for `LISTEN` notifications. Use session pooling or connect directly to PostgreSQL.
 - **At-least-once.** Handlers must be idempotent. A message can be delivered again after a lease expires, a crash, or a `Nak`.
 - **Ordering.** Each consumer claims messages in id order. With `MaxInFlight > 1` or several queue members they are processed concurrently, so there is no strict ordering.
 - **Ephemeral subscriptions** only see messages published after the subscription was created. That holds for plain `Subscribe` and for non-durable queue groups. A queue group keeps receiving messages for up to the TTL after its last member leaves.
