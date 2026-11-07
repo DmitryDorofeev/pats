@@ -15,7 +15,7 @@ NATS-style publish/subscribe for Go, backed only by PostgreSQL. The name is shor
 
 ## How it works
 
-Messages are rows. Every subscription is backed by a *consumer* row. An `AFTER INSERT` trigger on `messages` creates one `deliveries` row per matching consumer and calls `pg_notify(<schema>, <consumer id>)`.
+Messages are rows. Every subscription is backed by a *consumer* row. Publishing is a single SQL statement: it inserts the message, one `deliveries` row per matching consumer, and calls `pg_notify(<schema>, <consumer id>)` for each. pats installs no triggers or SQL functions; all behaviour is in the Go client.
 
 Each `Conn` keeps one connection in `LISTEN`. A notification only *wakes* the matching subscriptions. They then claim work with `SELECT … FOR UPDATE SKIP LOCKED`, which sets a lease (`visible_at`). Ack deletes the delivery, and the last ack of a message deletes the message. If a message isn't acked before its lease runs out, it is delivered again. A message that matches no consumer when it is published is not stored.
 
@@ -88,7 +88,7 @@ res, err = m.Migrate(ctx, patsmigrate.DirectionDown,
 vr, err := m.Validate(ctx, nil)                                      // vr.OK is false while versions are pending
 ```
 
-pats is unreleased, so the whole schema is currently a single migration, `001_initial_schema`. Later schema changes will be added as `002_…` and so on.
+Versions so far: `001_initial_schema`, and `002_fanout_in_go`, which replaces the fan-out trigger and plpgsql functions of version 1 with logic in the Go client. Clients from before version 2 need the trigger, so upgrade the schema and every client together.
 
 `MigrateOpts` also has `MaxSteps`, `TargetVersion` and `DryRun`. If you use another migration tool (Goose, Atlas, …), copy the SQL from `m.AllVersions()` and pass it through `m.Render(sql)` to fill in the schema name.
 

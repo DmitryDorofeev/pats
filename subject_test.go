@@ -2,7 +2,7 @@ package pats
 
 import "testing"
 
-// matchCases is mirrored by the SQL function test in integration/testsuite.
+// matchCases is mirrored by the publish matching test in integration/testsuite.
 var matchCases = []struct {
 	pattern, subject string
 	want             bool
@@ -60,6 +60,25 @@ func TestValidate(t *testing.T) {
 	for _, s := range badPat {
 		if err := ValidatePattern(s); err == nil {
 			t.Errorf("ValidatePattern(%q): expected error", s)
+		}
+	}
+}
+
+func TestPatternColumns(t *testing.T) {
+	cases := []struct {
+		pattern, tokens string
+		wild, tail      bool
+	}{
+		{"a.b", "a.b", false, false},
+		{"a.*", "a.*", true, false},
+		{"a.>", "a", true, true},
+		{">", "", true, true},
+		{"*.b.>", "*.b", true, true},
+	}
+	for _, c := range cases {
+		wild, tokens, tail := patternColumns(c.pattern)
+		if wild != c.wild || tokens != c.tokens || tail != c.tail {
+			t.Errorf("patternColumns(%q) = %v, %q, %v; want %v, %q, %v", c.pattern, wild, tokens, tail, c.wild, c.tokens, c.tail)
 		}
 	}
 }

@@ -57,7 +57,10 @@ func (m *Msg) AckCtx(ctx context.Context) error {
 	if err := m.settle(); err != nil {
 		return err
 	}
-	_, err := queryBool(ctx, m.sub.conn.drv, m.sub.conn.q.ack, m.consumerID, m.ID)
+	ok, err := queryBool(ctx, m.sub.conn.drv, m.sub.conn.q.ack, m.consumerID, m.ID)
+	if ok {
+		m.sub.conn.release(ctx, m.ID)
+	}
 	return err
 }
 
@@ -108,6 +111,7 @@ func (m *Msg) TermCtx(ctx context.Context, reason string) error {
 	if !ok {
 		return ErrLeaseLost
 	}
+	m.sub.conn.release(ctx, m.ID)
 	return nil
 }
 

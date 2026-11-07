@@ -46,8 +46,20 @@ func validate(s string, wildcards bool) error {
 	return nil
 }
 
-// SubjectMatches reports whether subject matches pattern. It mirrors the
-// subject_matches SQL function installed by the migrations.
+// patternColumns returns the consumers columns that publish matches pattern
+// against: whether it has wildcards, its tokens without a trailing ">"
+// (dot-joined), and whether it ends in ">".
+func patternColumns(pattern string) (wild bool, tokens string, tail bool) {
+	tokens, tail = strings.CutSuffix(pattern, ">")
+	if tail {
+		tokens = strings.TrimSuffix(tokens, ".")
+	}
+	wild = tail || strings.Contains(pattern, "*")
+	return wild, tokens, tail
+}
+
+// SubjectMatches reports whether subject matches pattern. Publish applies the
+// same rule in SQL to the columns from patternColumns.
 func SubjectMatches(pattern, subject string) bool {
 	p := strings.Split(pattern, ".")
 	s := strings.Split(subject, ".")

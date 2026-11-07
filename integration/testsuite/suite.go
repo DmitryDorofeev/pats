@@ -219,9 +219,12 @@ func Run(t *testing.T, f Factory) {
 	}
 }
 
+// Publish matches subjects in SQL; it must agree with SubjectMatches. Each
+// case gets an offline durable consumer under its own prefix (which keeps
+// the case's meaning), so the stored delivery shows whether it matched.
 func testSubjectMatchesSQL(t *testing.T, f Factory) {
 	e := newEnv(t, f)
-	e.connect()
+	c := e.connect(pats.WithoutJanitor())
 	cases := []struct {
 		p, s string
 		want bool
@@ -230,16 +233,28 @@ func testSubjectMatchesSQL(t *testing.T, f Factory) {
 		{"a.*", "a.b", true}, {"a.*", "a", false}, {"a.*", "a.b.c", false}, {"*", "a", true},
 		{"*", "a.b", false}, {"a.>", "a.b", true}, {"a.>", "a.b.c", true}, {"a.>", "a", false},
 		{">", "a", true}, {">", "a.b.c", true}, {"a.*.>", "a.b.c", true}, {"a.*.>", "a.b", false},
-		{"a.*.c", "a.x.c", true}, {"a.*.c", "a.x.d", false},
+		{"a.*.c", "a.x.c", true}, {"a.*.c", "a.x.d", false}, {"a.b.>", "a.c.d", false},
 	}
-	for _, c := range cases {
-		var got bool
-		err := e.admin.QueryRow(ctx, "SELECT "+e.schema+".subject_matches($1, $2)", c.p, c.s).Scan(&got)
+	for i, tc := range cases {
+		name := fmt.Sprintf("match%d", i)
+		pattern, subject := fmt.Sprintf("t%d.%s", i, tc.p), fmt.Sprintf("t%d.%s", i, tc.s)
+		sub, err := c.Subscribe(ctx, pattern, func(*pats.Msg) {}, pats.Durable(name))
 		if err != nil {
 			t.Fatal(err)
 		}
-		if got != c.want || got != pats.SubjectMatches(c.p, c.s) {
-			t.Errorf("subject_matches(%q, %q) = %v, want %v", c.p, c.s, got, c.want)
+		if err := sub.Unsubscribe(); err != nil {
+			t.Fatal(err)
+		}
+		if err := c.Publish(ctx, subject, nil); err != nil {
+			t.Fatal(err)
+		}
+		var n int
+		err = e.admin.QueryRow(ctx, "SELECT count(*) FROM "+e.schema+".deliveries d JOIN "+e.schema+".consumers c ON c.id = d.consumer_id WHERE c.name = $1", name).Scan(&n)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := n == 1; got != tc.want || got != pats.SubjectMatches(pattern, subject) {
+			t.Errorf("publish %q to %q matched = %v, want %v", subject, pattern, got, tc.want)
 		}
 	}
 }
@@ -642,11 +657,11 @@ func testJanitor(t *testing.T, f Factory) {
 	e := newEnv(t, f)
 	c := e.connect(pats.WithJanitorInterval(100*time.Millisecond), pats.WithHeartbeat(50*time.Millisecond, 500*time.Millisecond))
 	if _, err := e.admin.Exec(ctx, fmt.Sprintf(
-		"INSERT INTO %s.consumers (name, filter, last_seen) VALUES ('stale', 'j.*', now() - interval '1 hour')", e.schema)); err != nil {
+		"INSERT INTO %s.consumers (name, filter, wild, tokens, tail, last_seen) VALUES ('stale', 'j.*', true, '{j,*}', false, now() - interval '1 hour')", e.schema)); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := e.admin.Exec(ctx, fmt.Sprintf(
-		"INSERT INTO %s.consumers (name, filter, durable, last_seen) VALUES ('keep', 'nothing', true, now() - interval '1 hour')", e.schema)); err != nil {
+		"INSERT INTO %s.consumers (name, filter, wild, tokens, tail, durable, last_seen) VALUES ('keep', 'nothing', false, '{nothing}', false, true, now() - interval '1 hour')", e.schema)); err != nil {
 		t.Fatal(err)
 	}
 	_ = c.Publish(ctx, "j.1", nil)  // delivery for 'stale'
@@ -836,7 +851,7 @@ func testOrphanReaper(t *testing.T, f Factory) {
 		t.Fatal(err)
 	}
 	if _, err := e.admin.Exec(ctx, fmt.Sprintf(
-		"INSERT INTO %s.consumers (name, filter, durable) VALUES ('gone', 'orphan', true)", e.schema)); err != nil {
+		"INSERT INTO %s.consumers (name, filter, wild, tokens, tail, durable) VALUES ('gone', 'orphan', false, '{orphan}', false, true)", e.schema)); err != nil {
 		t.Fatal(err)
 	}
 	// A backlog of messages that are still pending, then orphans behind it.

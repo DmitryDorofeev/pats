@@ -13,7 +13,7 @@ func TestEmbeddedMigrations(t *testing.T) {
 		t.Fatal(err)
 	}
 	all := m.AllVersions()
-	if len(all) != 1 || all[0].Version != 1 || all[0].Name != "initial schema" {
+	if len(all) != 2 || all[0].Version != 1 || all[0].Name != "initial schema" || all[1].Version != 2 || all[1].Name != "fanout in go" {
 		t.Fatalf("migrations = %+v", all)
 	}
 	if !strings.Contains(m.Render(all[0].SQLUp), "CREATE TABLE pats.messages") {

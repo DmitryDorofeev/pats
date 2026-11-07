@@ -125,7 +125,7 @@ func (c *Conn) publish(ctx context.Context, q Querier, m *Msg) error {
 			return fmt.Errorf("reply: %w", err)
 		}
 	}
-	return q.Exec(ctx, c.q.publish, m.Subject, m.Data, m.Reply)
+	return q.Exec(ctx, c.q.publish, m.Subject, m.Data, m.Reply, c.schema)
 }
 
 // Request publishes data to subject with a unique reply subject and waits for
@@ -294,7 +294,8 @@ func (c *Conn) subscribe(ctx context.Context, subject, queue string, cb MsgHandl
 }
 
 func (c *Conn) upsertConsumer(ctx context.Context, name, filter string, durable bool) (int64, error) {
-	rows, err := c.drv.Query(ctx, c.q.upsertConsumer, name, filter, durable)
+	wild, tokens, tail := patternColumns(filter)
+	rows, err := c.drv.Query(ctx, c.q.upsertConsumer, name, filter, durable, wild, tokens, tail)
 	if err != nil {
 		return 0, err
 	}
@@ -404,6 +405,17 @@ func (c *Conn) logError(msg string, err error, args ...any) {
 		return
 	}
 	c.opts.logger.Error("pats: "+msg, append([]any{"error", err}, args...)...)
+}
+
+// release deletes a message after its delivery was removed, once no consumer
+// holds it any more. It runs as its own autocommit statement after the
+// delivery's removal has committed. Of two consumers releasing one message
+// concurrently, the later statement therefore sees both deliveries gone. (A
+// single statement would see the other's delivery in its snapshot, and both
+// would keep the message.) A failure only leaves an orphan for the janitor, so
+// it is logged rather than returned: the ack or term itself succeeded.
+func (c *Conn) release(ctx context.Context, messageID int64) {
+	c.logError("release message", c.drv.Exec(ctx, c.q.release, messageID), "message", messageID)
 }
 
 // queryBool runs a statement returning at most one boolean row. No row
